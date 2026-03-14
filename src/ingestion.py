@@ -1,11 +1,26 @@
+"""
+Ingestion layer
+===============
+Validates and persists data from any DataProvider into the local database.
+
+Architecture
+------------
+  DataProvider  →  list[dict]  →  Pydantic schema  →  SQLAlchemy model  →  DB
+  ──────────────────────────────────────────────────────────────────────────────
+  CSVDataProvider     local CSV files          (structured)
+  MockApiProvider     external REST / JSON     (semi-structured)
+  MockDatabaseProvider  legacy CRM database    (structured, foreign schema)
+
+Every provider is decoupled from the Pydantic and ORM layers: swapping the
+source never touches validation or persistence code.
+"""
+
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable, List, TypeVar
 
-import pandas as pd
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
@@ -21,6 +36,12 @@ from src.models import (
     StockMaster,
     Trade,
 )
+from src.providers import (
+    CSVDataProvider,
+    DataProvider,
+    MockApiProvider,
+    MockDatabaseProvider,
+)
 from src.schemas import (
     AccountMapRow,
     CustomerRow,
@@ -34,34 +55,31 @@ from src.schemas import (
 
 LOGGER = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-
 TModel = TypeVar("TModel")
 TSchema = TypeVar("TSchema", bound=BaseModel)
+
+
+# ---------------------------------------------------------------------------
+# Result container
+# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
 class IngestionResult:
     table_name: str
+    source_label: str = "unknown"
     success_count: int = 0
     failure_count: int = 0
     errors: list[str] = field(default_factory=list)
 
 
-def _load_csv(filename: str, dedupe_subset: list[str] | None = None) -> list[dict[str, object]]:
-    """Load a CSV file, optionally drop duplicates, and normalize missing values."""
-    path = DATA_DIR / filename
-    df = pd.read_csv(path)
-
-    if dedupe_subset:
-        df = df.drop_duplicates(subset=dedupe_subset, keep="first")
-
-    df = df.where(pd.notna(df), None)
-    return df.to_dict(orient="records")
+# ---------------------------------------------------------------------------
+# Low-level helpers
+# ---------------------------------------------------------------------------
 
 
 def _bulk_insert(session: Session, model_cls: type[TModel], objects: List[TModel]) -> None:
-    """Replace all rows in the table for model_cls with the given objects."""
+    """Truncate and replace all rows for *model_cls* in a single operation."""
     session.execute(delete(model_cls))
     if objects:
         session.add_all(objects)
@@ -71,28 +89,46 @@ def _build_row_error(table_name: str, row_number: int, message: str) -> str:
     return f"{table_name}: row {row_number} - {message}"
 
 
-def _ingest_file(
+# ---------------------------------------------------------------------------
+# Generic ingestion engine
+# ---------------------------------------------------------------------------
+
+
+def _ingest(
     *,
     table_name: str,
-    filename: str,
+    provider: DataProvider,
     schema_cls: type[TSchema],
     model_cls: type[TModel],
     factory: Callable[[TSchema], TModel],
-    dedupe_subset: list[str] | None = None,
 ) -> IngestionResult:
-    result = IngestionResult(table_name=table_name)
+    """
+    Core ingestion pipeline.
+
+    1. Ask the provider for raw records (list[dict]).
+    2. Validate / coerce each record through *schema_cls*.
+    3. Convert validated rows to ORM instances via *factory*.
+    4. Persist all valid instances in a single atomic transaction.
+
+    Row-level failures are logged and counted without halting the pipeline.
+    A transaction failure rolls back all rows for this table and is reported
+    in the result.
+    """
+    result = IngestionResult(table_name=table_name, source_label=provider.source_label)
     objects: List[TModel] = []
 
-    LOGGER.info("Starting ingestion for %s.", table_name)
+    LOGGER.info("Ingesting '%s' from %s.", table_name, provider.source_label)
 
+    # ── 1. Fetch raw records ────────────────────────────────────────────────
     try:
-        records = _load_csv(filename, dedupe_subset=dedupe_subset)
+        records = provider.fetch()
     except Exception as exc:  # noqa: BLE001
-        message = f"{table_name}: failed to read {filename} - {exc}"
+        message = f"{table_name}: provider fetch failed - {exc}"
         LOGGER.exception(message)
         result.errors.append(message)
         return result
 
+    # ── 2 & 3. Validate and build ORM objects ───────────────────────────────
     for row_number, record in enumerate(records, start=2):
         try:
             validated_row = schema_cls.model_validate(record)
@@ -108,12 +144,18 @@ def _ingest_file(
             result.failure_count += 1
             result.errors.append(message)
 
+    # ── 4. Persist ──────────────────────────────────────────────────────────
     try:
         with SessionLocal() as session:
             with session.begin():
                 _bulk_insert(session, model_cls, objects)
         result.success_count = len(objects)
-        LOGGER.info("Successfully ingested %d rows into %s.", result.success_count, table_name)
+        LOGGER.info(
+            "Persisted %d row(s) into '%s' (source: %s).",
+            result.success_count,
+            table_name,
+            provider.source_label,
+        )
     except Exception as exc:  # noqa: BLE001
         message = f"{table_name}: database transaction failed - {exc}"
         LOGGER.exception(message)
@@ -124,10 +166,18 @@ def _ingest_file(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Per-table ingestion functions
+# Each function is responsible for:
+#   • choosing the DataProvider (the "source")
+#   • mapping validated schema fields to the ORM model
+# ---------------------------------------------------------------------------
+
+
 def ingest_customers() -> IngestionResult:
-    return _ingest_file(
+    return _ingest(
         table_name="customers",
-        filename="customers.csv",
+        provider=CSVDataProvider("customers.csv"),
         schema_cls=CustomerRow,
         model_cls=Customer,
         factory=lambda row: Customer(
@@ -141,9 +191,10 @@ def ingest_customers() -> IngestionResult:
 
 
 def ingest_account_map() -> IngestionResult:
-    return _ingest_file(
+    """Ingest account mapping data from an external (legacy CRM) database source."""
+    return _ingest(
         table_name="account_map",
-        filename="account_map.csv",
+        provider=MockDatabaseProvider(),
         schema_cls=AccountMapRow,
         model_cls=AccountMap,
         factory=lambda row: AccountMap(
@@ -155,12 +206,11 @@ def ingest_account_map() -> IngestionResult:
 
 
 def ingest_stocks_master() -> IngestionResult:
-    return _ingest_file(
+    return _ingest(
         table_name="stocks_master",
-        filename="stocks_master.csv",
+        provider=CSVDataProvider("stocks_master.csv", dedupe_subset=["Ticker"]),
         schema_cls=StockMasterRow,
         model_cls=StockMaster,
-        dedupe_subset=["Ticker"],
         factory=lambda row: StockMaster(
             ticker=row.Ticker,
             company_name=row.CompanyName,
@@ -173,9 +223,9 @@ def ingest_stocks_master() -> IngestionResult:
 
 
 def ingest_discount_rules() -> IngestionResult:
-    return _ingest_file(
+    return _ingest(
         table_name="discount_rules",
-        filename="discount_rules.csv",
+        provider=CSVDataProvider("discount_rules.csv"),
         schema_cls=DiscountRuleRow,
         model_cls=DiscountRule,
         factory=lambda row: DiscountRule(
@@ -188,9 +238,10 @@ def ingest_discount_rules() -> IngestionResult:
 
 
 def ingest_fx_rates() -> IngestionResult:
-    return _ingest_file(
+    """Ingest FX rates from a mock external API (simulates a live currency feed)."""
+    return _ingest(
         table_name="fx_rates_usd",
-        filename="fx_rates_usd.csv",
+        provider=MockApiProvider(),
         schema_cls=FxRateUsdRow,
         model_cls=FxRateUSD,
         factory=lambda row: FxRateUSD(
@@ -202,9 +253,9 @@ def ingest_fx_rates() -> IngestionResult:
 
 
 def ingest_holdings_snapshot() -> IngestionResult:
-    return _ingest_file(
+    return _ingest(
         table_name="holdings_snapshot",
-        filename="holdings_snapshot.csv",
+        provider=CSVDataProvider("holdings_snapshot.csv"),
         schema_cls=HoldingSnapshotRow,
         model_cls=HoldingSnapshot,
         factory=lambda row: HoldingSnapshot(
@@ -217,9 +268,9 @@ def ingest_holdings_snapshot() -> IngestionResult:
 
 
 def ingest_price_history() -> IngestionResult:
-    return _ingest_file(
+    return _ingest(
         table_name="price_history",
-        filename="price_history.csv",
+        provider=CSVDataProvider("price_history.csv"),
         schema_cls=PriceHistoryRow,
         model_cls=PriceHistory,
         factory=lambda row: PriceHistory(
@@ -232,9 +283,10 @@ def ingest_price_history() -> IngestionResult:
 
 
 def ingest_trades() -> IngestionResult:
-    return _ingest_file(
+    """Ingest trades from CSV (source system A)."""
+    return _ingest(
         table_name="trades_source_a",
-        filename="trades_source_a.csv",
+        provider=CSVDataProvider("trades_source_a.csv"),
         schema_cls=TradeRow,
         model_cls=Trade,
         factory=lambda row: Trade(
@@ -250,17 +302,23 @@ def ingest_trades() -> IngestionResult:
     )
 
 
-def _format_summary(results: list[IngestionResult]) -> str:
-    header = f"{'Table':<20} {'Success':>10} {'Failed':>10}"
-    separator = "-" * len(header)
+# ---------------------------------------------------------------------------
+# Summary formatting
+# ---------------------------------------------------------------------------
 
-    lines = [
-        "",
-        "Ingestion Summary",
-        separator,
-        header,
-        separator,
-    ]
+
+def _format_summary(results: list[IngestionResult]) -> str:
+    col_table = 22
+    col_source = 36
+    col_count = 10
+
+    header = (
+        f"{'Table':<{col_table}} {'Source':<{col_source}}"
+        f" {'Success':>{col_count}} {'Failed':>{col_count}}"
+    )
+    separator = "─" * len(header)
+
+    lines = ["", "Ingestion Summary", separator, header, separator]
 
     total_success = 0
     total_failure = 0
@@ -269,13 +327,15 @@ def _format_summary(results: list[IngestionResult]) -> str:
         total_success += result.success_count
         total_failure += result.failure_count
         lines.append(
-            f"{result.table_name:<20} {result.success_count:>10} {result.failure_count:>10}"
+            f"{result.table_name:<{col_table}} {result.source_label:<{col_source}}"
+            f" {result.success_count:>{col_count}} {result.failure_count:>{col_count}}"
         )
 
     lines.extend(
         [
             separator,
-            f"{'TOTAL':<20} {total_success:>10} {total_failure:>10}",
+            f"{'TOTAL':<{col_table}} {'':<{col_source}}"
+            f" {total_success:>{col_count}} {total_failure:>{col_count}}",
         ]
     )
 
@@ -284,19 +344,35 @@ def _format_summary(results: list[IngestionResult]) -> str:
         lines.append("")
         lines.append("Errors")
         lines.append(separator)
-        lines.extend(f"- {error}" for error in all_errors)
+        lines.extend(f"  • {error}" for error in all_errors)
 
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Unified entry point
+# ---------------------------------------------------------------------------
+
+
 def ingest_all() -> list[IngestionResult]:
-    """Run full ingestion pipeline in foreign-key-safe order."""
+    """Run the full ingestion pipeline, demonstrating all three source types.
+
+    Source breakdown
+    ────────────────
+    CSV              customers, stocks_master, discount_rules,
+                     holdings_snapshot, price_history, trades_source_a
+    Mock API         fx_rates_usd   (simulates a live external currency feed)
+    Mock Database    account_map    (simulates a legacy CRM database SELECT)
+    """
     results = [
+        # ── CSV sources ──────────────────────────────────────────────────────
         ingest_customers(),
-        ingest_account_map(),
         ingest_stocks_master(),
         ingest_discount_rules(),
-        ingest_fx_rates(),
+        # ── External Database source ─────────────────────────────────────────
+        ingest_account_map(),
+        # ── CSV sources (depend on customers / stocks_master) ────────────────
+        ingest_fx_rates(),          # ← Mock API
         ingest_holdings_snapshot(),
         ingest_price_history(),
         ingest_trades(),
@@ -304,4 +380,3 @@ def ingest_all() -> list[IngestionResult]:
 
     print(_format_summary(results))
     return results
-

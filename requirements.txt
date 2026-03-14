@@ -1,3 +1,5 @@
+fastapi
 pandas
 pydantic
 sqlalchemy>=2.0
+uvicorn[standard]
